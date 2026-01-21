@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Bash(dir:*)",
+      "Bash(python main.py parse:*)",
+      "Bash(python:*)",
+      "Bash(findstr:*)",
+      "Bash(timeout:*)",
+      "Bash(tee:*)",
+      "Bash(time python:*)",
+      "WebSearch",
+      "Bash(cat:*)",
+      "Bash(git add:*)",
+      "Bash(del:*)",
+      "Bash(rm:*)"
+    ]
+  }
+}

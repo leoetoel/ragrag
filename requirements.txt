@@ -1,0 +1,8 @@
+# PDF Parsing with Docling
+docling>=2.68.0
+
+# Core dependencies (installed with docling)
+pydantic>=2.0.0,<3.0.0
+docling-core>=2.50.0
+docling-parse>=4.7.0
+pypdfium2>=4.30.0
