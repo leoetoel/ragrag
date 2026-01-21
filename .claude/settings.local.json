@@ -22,7 +22,8 @@
       "Bash(docker-compose:*)",
       "Bash(docker:*)",
       "Bash(powershell:*)",
-      "Bash(ConvertFrom-Json)"
+      "Bash(ConvertFrom-Json)",
+      "Bash(git rm:*)"
     ]
   }
 }

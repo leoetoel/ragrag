@@ -12,7 +12,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from pdf_parser import DoclingPDFParser
 from pdf_parser.utils import get_pdf_files, logger
 from chunker import MarkdownChunker
-from embedding import BGEEmbedder, MilvusVectorStore, EmbeddingConfig, MilvusConfig
+from embedding import (
+    BGEEmbedder, MilvusVectorStore, HybridSearcher,
+    EmbeddingConfig, MilvusConfig
+)
 
 
 def parse_single_file(args):
@@ -273,6 +276,74 @@ def search_vectors(args):
         print(f"Page: {result.page}")
         print(f"Section: {result.section}")
         print(f"Content Preview: {result.content[:200]}...")
+        print()
+
+
+def hybrid_search_vectors(args):
+    """Hybrid search combining BM25 and Vector retrieval."""
+    import json
+
+    # Initialize embedder
+    embed_config = EmbeddingConfig(
+        model_name=args.model,
+        device=args.device
+    )
+    embedder = BGEEmbedder(embed_config)
+
+    # Initialize vector store
+    store_config = MilvusConfig(
+        host=args.host,
+        port=args.port,
+        collection_name=args.collection,
+        metric_type=args.metric_type
+    )
+    store = MilvusVectorStore(store_config)
+    store.load_collection()
+
+    # Initialize hybrid searcher
+    hybrid_searcher = HybridSearcher(
+        vector_store=store,
+        embedder=embedder
+    )
+
+    # Load chunks for BM25
+    if args.chunks_file:
+        print(f"Loading chunks from {args.chunks_file} for BM25...")
+        with open(args.chunks_file, 'r', encoding='utf-8') as f:
+            chunks = json.load(f)
+        hybrid_searcher.load_chunks_for_bm25(chunks)
+        print(f"Loaded {len(chunks)} chunks for BM25 indexing")
+    else:
+        print("Warning: No chunks file provided. BM25 will be skipped.")
+        print("Use --chunks-file parameter to enable BM25 retrieval.")
+
+    # Perform hybrid search
+    print(f"\n=== Hybrid Search ===")
+    print(f"Query: {args.query}")
+    print(f"BM25 top-k: {args.bm25_k}")
+    print(f"Vector top-k: {args.vector_k}")
+    print(f"RRF k: {args.rrf_k}")
+    print()
+
+    results = hybrid_searcher.search_hybrid(
+        query=args.query,
+        top_k=args.top_k,
+        bm25_k=args.bm25_k,
+        vector_k=args.vector_k,
+        rrf_k=args.rrf_k
+    )
+
+    print(f"\n=== Results (RRF Fusion) ===")
+    print(f"Top {len(results)} Results:\n")
+
+    for i, result in enumerate(results, 1):
+        print(f"--- Result {i} ---")
+        print(f"Fusion Score: {result['fusion_score']:.6f}")
+        print(f"Vector Score: {result['vector_score']:.4f}")
+        print(f"Source: {result['source']}")
+        print(f"Page: {result['page']}")
+        print(f"Section: {result['section']}")
+        print(f"Content Preview: {result['content'][:200]}...")
         print()
 
 
@@ -537,6 +608,93 @@ Examples:
         help='Number of results to return (default: 5)'
     )
 
+    # Hybrid Search command
+    hybrid_parser = subparsers.add_parser('hybrid-search', help='Hybrid search (BM25 + Vector + RRF)')
+
+    hybrid_parser.add_argument(
+        'query',
+        type=str,
+        help='Query text'
+    )
+
+    hybrid_parser.add_argument(
+        '--chunks-file',
+        type=str,
+        required=True,
+        help='Path to chunks JSON file for BM25 indexing'
+    )
+
+    hybrid_parser.add_argument(
+        '--model',
+        type=str,
+        default='BAAI/bge-large-zh-v1.5',
+        help='Embedding model name (default: BAAI/bge-large-zh-v1.5)'
+    )
+
+    hybrid_parser.add_argument(
+        '--device',
+        type=str,
+        default='cuda',
+        help='Device: cuda, cpu, or mps (default: cuda)'
+    )
+
+    hybrid_parser.add_argument(
+        '--host',
+        type=str,
+        default='localhost',
+        help='Milvus server host (default: localhost)'
+    )
+
+    hybrid_parser.add_argument(
+        '--port',
+        type=int,
+        default=19530,
+        help='Milvus server port (default: 19530)'
+    )
+
+    hybrid_parser.add_argument(
+        '--collection',
+        type=str,
+        default='rag_chunks',
+        help='Collection name (default: rag_chunks)'
+    )
+
+    hybrid_parser.add_argument(
+        '--metric-type',
+        type=str,
+        default='IP',
+        choices=['IP', 'COSINE', 'L2'],
+        help='Metric type (default: IP)'
+    )
+
+    hybrid_parser.add_argument(
+        '--top-k',
+        type=int,
+        default=5,
+        help='Final number of results to return (default: 5)'
+    )
+
+    hybrid_parser.add_argument(
+        '--bm25-k',
+        type=int,
+        default=50,
+        help='Number of BM25 results for fusion (default: 50)'
+    )
+
+    hybrid_parser.add_argument(
+        '--vector-k',
+        type=int,
+        default=50,
+        help='Number of Vector results for fusion (default: 50)'
+    )
+
+    hybrid_parser.add_argument(
+        '--rrf-k',
+        type=int,
+        default=60,
+        help='RRF constant k (default: 60)'
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -571,6 +729,9 @@ Examples:
 
     elif args.command == 'search':
         search_vectors(args)
+
+    elif args.command == 'hybrid-search':
+        hybrid_search_vectors(args)
 
 
 if __name__ == "__main__":

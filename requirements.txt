@@ -11,5 +11,8 @@ pypdfium2>=4.30.0
 FlagEmbedding>=1.2.0
 pymilvus>=2.3.0
 
+# Hybrid Search
+fastbm25>=0.2.2
+
 # Data Processing
 numpy>=1.24.0
