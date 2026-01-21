@@ -15,7 +15,14 @@
       "Bash(cat:*)",
       "Bash(git add:*)",
       "Bash(del:*)",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(mkdir:*)",
+      "Bash(docker-compose:*)",
+      "Bash(docker:*)",
+      "Bash(powershell:*)",
+      "Bash(ConvertFrom-Json)"
     ]
   }
 }

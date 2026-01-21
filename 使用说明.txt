@@ -1,0 +1,415 @@
+===============================================
+  RAG文档处理系统 - 详细使用说明
+===============================================
+
+项目概述
+--------
+本项目是一个完整的RAG（检索增强生成）文档处理系统，支持：
+- PDF文档解析（使用Docling）
+- Markdown文档分块（智能chunker）
+- BGE向量化（中文优化模型）
+- Milvus向量数据库存储与检索
+
+
+环境要求
+--------
+- Python 3.8+
+- Docker & Docker Compose
+- CUDA（可选，用于GPU加速）
+
+
+===============================================
+第一部分：环境安装
+===============================================
+
+1. 安装Python依赖
+------------------
+pip install -r requirements.txt
+
+主要依赖包括：
+- docling: PDF解析
+- FlagEmbedding: BGE向量化模型
+- pymilvus: Milvus Python客户端
+- torch: 深度学习框架
+
+
+2. 验证安装
+------------
+python --version
+docker --version
+docker-compose --version
+
+
+===============================================
+第二部分：部署Milvus向量数据库
+===============================================
+
+1. 启动Milvus服务
+------------------
+在项目根目录执行：
+docker-compose up -d
+
+这将启动3个容器：
+- milvus-etcd: 配置存储
+- milvus-minio: 对象存储（端口9000、9001）
+- milvus-standalone: Milvus服务（端口19530、9091）
+
+2. 验证Milvus运行状态
+----------------------
+docker-compose ps
+
+确保所有容器状态为 "Up"
+
+3. 查看Milvus日志（可选）
+-------------------------
+docker-compose logs -f milvus-standalone
+
+4. 停止Milvus服务
+-----------------
+docker-compose down
+
+5. 完全清理（包括数据）
+----------------------
+docker-compose down -v
+# 注意：这会删除所有存储的向量数据
+
+
+===============================================
+第三部分：完整工作流程示例
+===============================================
+
+示例：从PDF到可搜索的向量数据库
+
+步骤1：解析PDF为Markdown
+-------------------------
+# 解析单个PDF文件
+python src/main.py parse data/2024年度报告.pdf -o output/moutai/2024年度报告.md
+
+# 批量解析目录中的所有PDF
+python src/main.py parse data/ -o output/moutai/
+
+参数说明：
+- --no-tables: 禁用表格提取
+- --no-images: 禁用图像提取
+- --ocr: 启用OCR（用于扫描版PDF）
+- --merge: 合并为单个文件
+
+
+步骤2：Markdown分块
+-------------------
+# 分块单个Markdown文件
+python src/main.py chunk output/moutai/2024年度报告.md -o output/chunks_test/
+
+# 批量分块目录中的所有Markdown文件
+python src/main.py chunk output/moutai/ -o output/chunks/
+
+参数说明：
+- --chunk-size 2000: 目标块大小（字符数，默认2000）
+- --overlap 200: 块之间的重叠字符数（默认200）
+- --hard-limit 4000: 最大块大小（默认4000）
+- --show-chunks: 显示块预览
+
+输出：每个Markdown文件生成一个对应的xxx_chunks.json文件
+
+
+步骤3：向量化并存入Milvus
+-------------------------
+# 将chunks向量化并存入Milvus
+python src/main.py embed output/chunks_test/2024年度报告_chunks.json --device cuda --overwrite
+
+参数说明：
+- --model BAAI/bge-large-zh-v1.5: 指定模型
+- --device cuda: 使用CUDA加速（可选：cpu、mps）
+- --batch-size 32: 批处理大小（默认32）
+- --host localhost: Milvus主机地址
+- --port 19530: Milvus端口
+- --collection rag_chunks: 集合名称
+- --index-type HNSW: 索引类型（可选：FLAT、IVF_FLAT、HNSW）
+- --metric-type IP: 相似度度量（可选：IP、COSINE、L2）
+- --overwrite: 覆盖已存在的集合
+
+输出示例：
+=== Embedding Summary ===
+Input File: output/chunks_test/2024年度报告_chunks.json
+Collection: rag_chunks
+Inserted Chunks: 751
+Model: BAAI/bge-large-zh-v1.5
+Dimension: 1024
+Total Entities in Collection: 751
+
+
+步骤4：向量搜索
+---------------
+# 搜索相关文档
+python src/main.py search "贵州茅台2024年营业收入" --device cuda --top-k 5
+
+参数说明：
+- --model BAAI/bge-large-zh-v1.5: 指定模型
+- --device cuda: 使用CUDA加速
+- --collection rag_chunks: 集合名称
+- --metric-type IP: 相似度度量
+- --top-k 5: 返回前5个结果
+
+输出示例：
+=== Search Results ===
+Query: 贵州茅台2024年营业收入
+Top 5 Results:
+
+--- Result 1 ---
+Score: 0.7380
+Source: output/moutai/2024年度报告.md
+Page: 110
+Section: 财务报告
+Content Preview: [相关内容预览...]
+
+--- Result 2 ---
+Score: 0.7285
+Source: output/moutai/2024年度报告.md
+Page: 2
+Section: 公司简介
+Content Preview: [相关内容预览...]
+
+
+===============================================
+第四部分：命令详解
+===============================================
+
+1. parse命令 - PDF解析
+----------------------
+语法：python src/main.py parse <input> [-o output] [选项]
+
+输入：
+- 文件路径：解析单个PDF
+- 目录路径：批量解析目录下所有PDF
+
+选项：
+- --merge: 合并所有输出为单个文件（仅目录输入）
+- --no-tables: 不提取表格
+- --no-images: 不提取图像
+- --no-structure: 不提取文档结构
+- --ocr: 启用OCR（扫描版PDF）
+- --show-text: 显示提取内容预览
+- --no-page-markers: 不添加页码标记
+
+示例：
+python src/main.py parse data/report.pdf -o output.md
+python src/main.py parse data/pdfs/ -o output/ --merge
+
+
+2. chunk命令 - 文档分块
+-----------------------
+语法：python src/main.py chunk <input> -o <output> [选项]
+
+输入：
+- 文件路径：分块单个Markdown文件
+- 目录路径：批量分块目录下所有Markdown文件
+
+选项：
+- --chunk-size N: 目标块大小（字符数）
+- --overlap N: 块之间重叠字符数
+- --hard-limit N: 最大块字符数
+- --no-table-protection: 允许拆分表格
+- --show-chunks: 显示块预览
+
+示例：
+python src/main.py chunk report.md -o chunks/ --chunk-size 1500 --overlap 150
+
+
+3. embed命令 - 向量化
+---------------------
+语法：python src/main.py embed <input> [选项]
+
+输入：chunks JSON文件
+
+选项：
+- --model: 模型名称（默认BAAI/bge-large-zh-v1.5）
+- --device: 设备（cuda/cpu/mps）
+- --batch-size: 批处理大小
+- --host: Milvus主机
+- --port: Milvus端口
+- --collection: 集合名称
+- --index-type: 索引类型（FLAT/IVF_FLAT/HNSW）
+- --metric-type: 度量类型（IP/COSINE/L2）
+- --overwrite: 覆盖已存在的集合
+
+示例：
+python src/main.py embed chunks.json --overwrite
+python src/main.py embed chunks.json --collection my_docs --index-type IVF_FLAT
+
+
+4. search命令 - 向量搜索
+------------------------
+语法：python src/main.py search "<query>" [选项]
+
+选项：
+- --model: 模型名称
+- --device: 设备
+- --host: Milvus主机
+- --port: Milvus端口
+- --collection: 集合名称
+- --metric-type: 度量类型
+- --top-k N: 返回结果数量
+
+示例：
+python src/main.py search "茅台酒价格" --top-k 10
+python src/main.py search "财务数据" --collection financial_docs
+
+
+===============================================
+第五部分：高级配置
+===============================================
+
+1. BGE模型选择
+--------------
+中文优化模型：
+- BAAI/bge-large-zh-v1.5: 默认，1024维，512最大长度
+- BAAI/bge-small-zh-v1.5: 更小更快，512维
+
+多语言模型：
+- BAAI/bge-m3: 多语言，8192最大长度，1024维
+
+使用示例：
+python src/main.py embed chunks.json --model BAAI/bge-m3
+
+
+2. 索引类型选择
+--------------
+- FLAT: 最精确，但速度慢（适合小数据集）
+- IVF_FLAT: 平衡速度和精度（需要配置nlist参数）
+- HNSW: 最快，内存占用大（默认推荐）
+
+HNSW参数配置：
+- M: 每个节点的连接数（默认16，越大越精确但内存占用大）
+- efConstruction: 构建索引时的搜索范围（默认256）
+
+
+3. 相似度度量
+------------
+- IP (内积): 默认，适合归一化向量
+- COSINE: 余弦相似度，范围[-1, 1]
+- L2: 欧氏距离，越小越相似
+
+
+===============================================
+第六部分：常见问题
+===============================================
+
+Q1: 如何查看Milvus中存储的数据？
+--------------------------------
+A: 可以使用Milvus官方工具Attu（Web UI）：
+  docker run -d -p 8000:3000 \
+    -e MILVUS_URL=http://host.docker.internal:19530 \
+    zilliz/attu:latest
+  然后访问 http://localhost:8000
+
+Q2: 向量化时出现CUDA out of memory错误？
+----------------------------------------
+A: 解决方法：
+  1. 使用CPU：--device cpu
+  2. 减小批处理大小：--batch-size 16
+  3. 使用更小的模型：--model BAAI/bge-small-zh-v1.5
+
+Q3: 搜索结果不相关？
+------------------
+A: 调优方法：
+  1. 增加top-k值查看更多结果
+  2. 尝试不同的相似度度量：--metric-type COSINE
+  3. 使用更精确的查询描述
+  4. 重新分块，减小chunk_size以获得更精准的上下文
+
+Q4: 如何清空向量数据库？
+-----------------------
+A: 使用--overwrite选项重新嵌入：
+  python src/main.py embed chunks.json --overwrite
+
+Q5: 如何增量添加新文档？
+---------------------
+A: 不使用--overwrite选项，直接embed新的chunks文件：
+  python src/main.py embed new_chunks.json
+
+Q6: Milvus连接失败？
+------------------
+A: 检查：
+  1. Milvus是否运行：docker-compose ps
+  2. 端口是否正确：默认19530
+  3. 防火墙是否阻止
+  4. 查看Milvus日志：docker-compose logs milvus-standalone
+
+Q7: 模型下载慢？
+--------------
+A: 国内用户可以使用镜像：
+  export HF_ENDPOINT=https://hf-mirror.com
+  然后再运行命令
+
+
+===============================================
+第七部分：性能优化建议
+===============================================
+
+1. 大规模文档处理
+-----------------
+- 使用批处理模式处理多个文件
+- 适当增大batch_size（根据GPU内存）
+- 考虑使用多进程处理（可修改代码支持）
+
+2. 向量搜索优化
+--------------
+- 数据量<10万：使用FLAT索引（最精确）
+- 数据量10万-100万：使用IVF_FLAT索引
+- 数据量>100万：使用HNSW索引
+
+3. GPU加速
+---------
+- 确保安装了CUDA版本的PyTorch
+- 使用--device cuda启用GPU
+- 调整batch_size以充分利用GPU内存
+
+
+===============================================
+第八部分：项目结构说明
+===============================================
+
+项目根目录/
+├── data/                          # 原始PDF文档
+│   ├── 2024年度报告.pdf
+│   └── ...
+├── output/                        # 输出目录
+│   ├── moutai/                   # 解析的Markdown文件
+│   └── chunks_test/              # 分块后的JSON文件
+├── src/                          # 源代码
+│   ├── main.py                   # 主入口（CLI）
+│   ├── pdf_parser/               # PDF解析模块
+│   ├── chunker/                  # 文档分块模块
+│   └── embedding/                # 向量化模块
+│       ├── embedder.py          # BGE嵌入器
+│       ├── vector_store.py      # Milvus存储
+│       ├── models.py            # 数据模型
+│       └── utils.py             # 工具函数
+├── docker-compose.yml            # Milvus部署配置
+├── requirements.txt              # Python依赖
+├── volumes/                      # Docker数据卷（自动创建）
+│   ├── etcd/
+│   ├── minio/
+│   └── milvus/
+└── 使用说明.txt                  # 本文档
+
+
+===============================================
+技术支持
+===============================================
+
+项目使用的主要技术：
+- Docling: https://github.com/DS4SD/docling
+- BGE Embedding: https://github.com/FlagOpen/FlagEmbedding
+- Milvus: https://milvus.io/
+- PyMilvus: https://github.com/milvus-io/pymilvus
+
+相关文档：
+- Docling文档: https://ds4sd.github.io/docling/
+- Milvus文档: https://milvus.io/docs
+- BGE模型: https://huggingface.co/BAAI/bge-large-zh-v1.5
+
+
+===============================================
+更新日期: 2026-01-21
+===============================================

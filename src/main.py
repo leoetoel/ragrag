@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from pdf_parser import DoclingPDFParser
 from pdf_parser.utils import get_pdf_files, logger
+from chunker import MarkdownChunker
+from embedding import BGEEmbedder, MilvusVectorStore, EmbeddingConfig, MilvusConfig
 
 
 def parse_single_file(args):
@@ -72,24 +74,226 @@ def parse_directory(args):
     print(f"Page Markers: {'Enabled' if add_page_markers else 'Disabled'}")
 
 
+def chunk_file(args):
+    """Chunk a single Markdown file."""
+    import json
+
+    chunker = MarkdownChunker(
+        chunk_size=args.chunk_size,
+        chunk_overlap=args.overlap,
+        hard_limit=args.hard_limit,
+        preserve_tables=not args.no_table_protection
+    )
+
+    # Chunk the file
+    result = chunker.chunk_file(args.input)
+
+    # Save chunks as JSON array
+    output_path = Path(args.output)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    output_file = output_path / f"{Path(args.input).stem}_chunks.json"
+
+    # Convert chunks to the required format
+    chunks_output = []
+    for chunk in result.chunks:
+        chunk_data = {
+            "chunk_id": chunk.chunk_id,
+            "content": chunk.content,
+            "metadata": chunk.metadata
+        }
+        chunks_output.append(chunk_data)
+
+    # Write JSON array
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(chunks_output, f, ensure_ascii=False, indent=2)
+
+    print(f"Saved chunks to: {output_file}")
+
+    # Print summary
+    print(f"\n=== Chunking Summary ===")
+    print(f"Source: {args.input}")
+    print(f"Output: {output_file}")
+    print(f"Total Chunks: {result.total_chunks}")
+    print(f"Chunk Size: {args.chunk_size} chars")
+    print(f"Overlap: {args.overlap} chars")
+
+    # Show chunk statistics
+    sizes = [c.char_count for c in result.chunks]
+    print(f"Size Statistics:")
+    print(f"  Min: {min(sizes)} chars")
+    print(f"  Max: {max(sizes)} chars")
+    print(f"  Avg: {sum(sizes) // len(sizes)} chars")
+
+    if args.show_chunks:
+        print(f"\n=== First 3 Chunks Preview ===")
+        for i, chunk in enumerate(result.chunks[:3], 1):
+            print(f"\n--- Chunk {i} ---")
+            print(f"ID: {chunk.chunk_id}")
+            print(f"Section: {chunk.metadata.get('section', 'N/A')}")
+            print(f"Page: {chunk.metadata.get('page', 'N/A')}")
+            print(f"Characters: {chunk.char_count}")
+            print(f"Content Preview:\n{chunk.content[:300]}...")
+
+
+def chunk_directory(args):
+    """Chunk all Markdown files in a directory."""
+    import json
+
+    chunker = MarkdownChunker(
+        chunk_size=args.chunk_size,
+        chunk_overlap=args.overlap,
+        hard_limit=args.hard_limit,
+        preserve_tables=not args.no_table_protection
+    )
+
+    # Find all Markdown files
+    input_path = Path(args.input)
+    md_files = list(input_path.glob("*.md")) + list(input_path.glob("*.markdown"))
+
+    if not md_files:
+        logger.warning(f"No Markdown files found in {args.input}")
+        return
+
+    # Create output directory
+    output_path = Path(args.output)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    all_results = []
+    total_chunks = 0
+
+    # Process each file
+    for md_file in md_files:
+        print(f"\nProcessing: {md_file.name}")
+        result = chunker.chunk_file(str(md_file))
+        all_results.append(result)
+        total_chunks += result.total_chunks
+
+        # Save chunks for this file as JSON
+        output_file = output_path / f"{md_file.stem}_chunks.json"
+
+        # Convert chunks to the required format
+        chunks_output = []
+        for chunk in result.chunks:
+            chunk_data = {
+                "chunk_id": chunk.chunk_id,
+                "content": chunk.content,
+                "metadata": chunk.metadata
+            }
+            chunks_output.append(chunk_data)
+
+        # Write JSON array
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(chunks_output, f, ensure_ascii=False, indent=2)
+
+        print(f"  -> {output_file.name} ({result.total_chunks} chunks)")
+
+    # Print overall summary
+    print(f"\n=== Batch Chunking Summary ===")
+    print(f"Total Files: {len(md_files)}")
+    print(f"Total Chunks: {total_chunks}")
+    print(f"Output Directory: {output_path}")
+
+
+def embed_json(args):
+    """Embed chunks from JSON file and insert into Milvus."""
+    # Initialize embedder
+    embed_config = EmbeddingConfig(
+        model_name=args.model,
+        device=args.device,
+        batch_size=args.batch_size
+    )
+    embedder = BGEEmbedder(embed_config)
+
+    # Initialize vector store
+    store_config = MilvusConfig(
+        host=args.host,
+        port=args.port,
+        collection_name=args.collection,
+        index_type=args.index_type,
+        metric_type=args.metric_type
+    )
+    store = MilvusVectorStore(store_config)
+
+    # Create or load collection
+    store.create_collection(overwrite=args.overwrite)
+    store.load_collection()
+
+    # Load and embed chunks
+    count = store.insert_from_json(args.input, embedder)
+
+    print(f"\n=== Embedding Summary ===")
+    print(f"Input File: {args.input}")
+    print(f"Collection: {args.collection}")
+    print(f"Inserted Chunks: {count}")
+    print(f"Model: {args.model}")
+    print(f"Dimension: {embedder.get_dimension()}")
+
+    # Print collection info
+    info = store.get_collection_info()
+    print(f"\nTotal Entities in Collection: {info['num_entities']}")
+
+
+def search_vectors(args):
+    """Search for similar vectors."""
+    # Initialize embedder
+    embed_config = EmbeddingConfig(
+        model_name=args.model,
+        device=args.device
+    )
+    embedder = BGEEmbedder(embed_config)
+
+    # Initialize vector store
+    store_config = MilvusConfig(
+        host=args.host,
+        port=args.port,
+        collection_name=args.collection,
+        metric_type=args.metric_type
+    )
+    store = MilvusVectorStore(store_config)
+    store.load_collection()
+
+    # Encode query
+    query_embedding = embedder.encode_queries(args.query)
+
+    # Search
+    results = store.search(
+        query_embedding=query_embedding[0],
+        top_k=args.top_k
+    )
+
+    print(f"\n=== Search Results ===")
+    print(f"Query: {args.query}")
+    print(f"Top {args.top_k} Results:\n")
+
+    for i, result in enumerate(results, 1):
+        print(f"--- Result {i} ---")
+        print(f"Score: {result.score:.4f}")
+        print(f"Source: {result.source}")
+        print(f"Page: {result.page}")
+        print(f"Section: {result.section}")
+        print(f"Content Preview: {result.content[:200]}...")
+        print()
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="PDF Parser using Docling - Export PDFs to Markdown",
+        description="RAG Document Processor - Parse PDFs, chunk Markdown, and embed vectors",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Export single PDF to Markdown
   python main.py parse file.pdf -o output.md
 
-  # Export all PDFs in directory to Markdown
-  python main.py parse data/ -o output/
+  # Chunk a Markdown file
+  python main.py chunk report.md -o chunks/
 
-  # Merge all PDFs into one Markdown file
-  python main.py parse data/ -o output/ --merge
+  # Embed chunks into Milvus
+  python main.py embed chunks.json --overwrite
 
-  # Show Markdown preview
-  python main.py parse file.pdf -o output.md --show-text
+  # Search similar vectors
+  python main.py search "茅台酒2024年营业收入"
         """
     )
 
@@ -152,6 +356,187 @@ Examples:
         help='Disable page number markers in Markdown output'
     )
 
+    # Chunk command
+    chunk_parser = subparsers.add_parser('chunk', help='Chunk Markdown file(s)')
+
+    chunk_parser.add_argument(
+        'input',
+        type=str,
+        help='Path to Markdown file or directory containing Markdown files'
+    )
+
+    chunk_parser.add_argument(
+        '-o', '--output',
+        type=str,
+        required=True,
+        help='Output directory for chunks'
+    )
+
+    chunk_parser.add_argument(
+        '--chunk-size',
+        type=int,
+        default=2000,
+        help='Target chunk size in characters (default: 2000)'
+    )
+
+    chunk_parser.add_argument(
+        '--overlap',
+        type=int,
+        default=200,
+        help='Character overlap between chunks (default: 200)'
+    )
+
+    chunk_parser.add_argument(
+        '--hard-limit',
+        type=int,
+        default=4000,
+        help='Maximum allowed characters per chunk (default: 4000)'
+    )
+
+    chunk_parser.add_argument(
+        '--no-table-protection',
+        action='store_true',
+        help='Disable table protection (allow splitting tables)'
+    )
+
+    chunk_parser.add_argument(
+        '--show-chunks',
+        action='store_true',
+        help='Print preview of chunks to console'
+    )
+
+    # Embed command
+    embed_parser = subparsers.add_parser('embed', help='Embed chunks and insert into Milvus')
+
+    embed_parser.add_argument(
+        'input',
+        type=str,
+        help='Path to JSON file with chunks'
+    )
+
+    embed_parser.add_argument(
+        '--model',
+        type=str,
+        default='BAAI/bge-large-zh-v1.5',
+        help='Embedding model name (default: BAAI/bge-large-zh-v1.5)'
+    )
+
+    embed_parser.add_argument(
+        '--device',
+        type=str,
+        default='cuda',
+        help='Device: cuda, cpu, or mps (default: cuda)'
+    )
+
+    embed_parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=32,
+        help='Batch size for encoding (default: 32)'
+    )
+
+    embed_parser.add_argument(
+        '--host',
+        type=str,
+        default='localhost',
+        help='Milvus server host (default: localhost)'
+    )
+
+    embed_parser.add_argument(
+        '--port',
+        type=int,
+        default=19530,
+        help='Milvus server port (default: 19530)'
+    )
+
+    embed_parser.add_argument(
+        '--collection',
+        type=str,
+        default='rag_chunks',
+        help='Collection name (default: rag_chunks)'
+    )
+
+    embed_parser.add_argument(
+        '--index-type',
+        type=str,
+        default='HNSW',
+        choices=['FLAT', 'IVF_FLAT', 'HNSW'],
+        help='Index type (default: HNSW)'
+    )
+
+    embed_parser.add_argument(
+        '--metric-type',
+        type=str,
+        default='IP',
+        choices=['IP', 'COSINE', 'L2'],
+        help='Metric type (default: IP)'
+    )
+
+    embed_parser.add_argument(
+        '--overwrite',
+        action='store_true',
+        help='Overwrite existing collection'
+    )
+
+    # Search command
+    search_parser = subparsers.add_parser('search', help='Search for similar vectors')
+
+    search_parser.add_argument(
+        'query',
+        type=str,
+        help='Query text'
+    )
+
+    search_parser.add_argument(
+        '--model',
+        type=str,
+        default='BAAI/bge-large-zh-v1.5',
+        help='Embedding model name (default: BAAI/bge-large-zh-v1.5)'
+    )
+
+    search_parser.add_argument(
+        '--device',
+        type=str,
+        default='cuda',
+        help='Device: cuda, cpu, or mps (default: cuda)'
+    )
+
+    search_parser.add_argument(
+        '--host',
+        type=str,
+        default='localhost',
+        help='Milvus server host (default: localhost)'
+    )
+
+    search_parser.add_argument(
+        '--port',
+        type=int,
+        default=19530,
+        help='Milvus server port (default: 19530)'
+    )
+
+    search_parser.add_argument(
+        '--collection',
+        type=str,
+        default='rag_chunks',
+        help='Collection name (default: rag_chunks)'
+    )
+
+    search_parser.add_argument(
+        '--metric-type',
+        type=str,
+        default='IP',
+        choices=['IP', 'COSINE', 'L2'],
+        help='Metric type (default: IP)'
+    )
+
+    search_parser.add_argument(
+        '--top-k',
+        type=int,
+        default=5,
+        help='Number of results to return (default: 5)'
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -169,6 +554,23 @@ Examples:
         else:
             logger.error(f"Invalid path: {args.input}")
             sys.exit(1)
+
+    elif args.command == 'chunk':
+        input_path = Path(args.input)
+
+        if input_path.is_file():
+            chunk_file(args)
+        elif input_path.is_dir():
+            chunk_directory(args)
+        else:
+            logger.error(f"Invalid path: {args.input}")
+            sys.exit(1)
+
+    elif args.command == 'embed':
+        embed_json(args)
+
+    elif args.command == 'search':
+        search_vectors(args)
 
 
 if __name__ == "__main__":

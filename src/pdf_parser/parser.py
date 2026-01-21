@@ -32,7 +32,10 @@ class DoclingPDFParser:
         footer_margin_ratio: float = 0.1,
         header_footer_patterns: bool = True,
         custom_header_patterns: list = None,
-        custom_footer_patterns: list = None
+        custom_footer_patterns: list = None,
+        extract_tables: bool = True,
+        extract_images: bool = True,
+        extract_structure: bool = True
     ):
         """
         Initialize the PDF parser.
@@ -45,6 +48,9 @@ class DoclingPDFParser:
             header_footer_patterns: Whether to use pattern matching for better detection
             custom_header_patterns: Custom regex patterns for headers
             custom_footer_patterns: Custom regex patterns for footers
+            extract_tables: Whether to extract tables (kept for compatibility)
+            extract_images: Whether to extract images (kept for compatibility)
+            extract_structure: Whether to extract document structure (kept for compatibility)
         """
         self.ocr_enabled = ocr_enabled
         self.exclude_headers_footers = exclude_headers_footers
@@ -310,3 +316,219 @@ class DoclingPDFParser:
                 return True
 
         return False
+
+    def save_to_markdown(
+        self,
+        pdf_path: Union[str, Path],
+        output_path: Union[str, Path],
+        add_page_markers: bool = True
+    ) -> str:
+        """
+        Parse PDF and save as Markdown file.
+
+        Args:
+            pdf_path: Path to the PDF file
+            output_path: Path to save the Markdown file
+            add_page_markers: Whether to add page number markers
+
+        Returns:
+            The markdown content as string
+        """
+        # Validate path
+        path = validate_pdf_path(pdf_path)
+
+        logger.info(f"Parsing PDF to Markdown: {path}")
+
+        try:
+            # Convert document
+            doc = self.converter.convert(str(path))
+
+            if add_page_markers:
+                # Export with page markers
+                markdown_content = self._export_to_markdown_with_pages(doc)
+            else:
+                # Standard export
+                markdown_content = doc.document.export_to_markdown()
+
+            # Save to file
+            output = Path(output_path)
+            output.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(output, 'w', encoding='utf-8') as f:
+                f.write(markdown_content)
+
+            logger.info(f"Saved Markdown to {output} ({len(markdown_content)} chars)")
+
+            return markdown_content
+
+        except Exception as e:
+            logger.error(f"Error parsing PDF to Markdown {path}: {str(e)}")
+            raise
+
+    def save_batch_to_markdown(
+        self,
+        pdf_paths: List[Union[str, Path]],
+        output_dir: Union[str, Path],
+        merge: bool = False,
+        add_page_markers: bool = True
+    ) -> None:
+        """
+        Parse batch PDFs and save as Markdown files.
+
+        Args:
+            pdf_paths: List of paths to PDF files
+            output_dir: Directory to save Markdown files
+            merge: Whether to merge all results into one file
+            add_page_markers: Whether to add page number markers
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        if merge:
+            # Merge all markdown into one file
+            all_markdowns = []
+
+            for pdf_path in pdf_paths:
+                try:
+                    logger.info(f"Processing: {pdf_path}")
+                    doc = self.converter.convert(str(pdf_path))
+
+                    # Export with or without page markers
+                    if add_page_markers:
+                        markdown_content = self._export_to_markdown_with_pages(doc)
+                    else:
+                        markdown_content = doc.document.export_to_markdown()
+
+                    # Add file name as header
+                    pdf_name = Path(pdf_path).stem
+                    section = f"\n\n# {pdf_name}\n\n{markdown_content}\n\n---\n"
+                    all_markdowns.append(section)
+
+                except Exception as e:
+                    logger.error(f"Failed to process {pdf_path}: {str(e)}")
+
+            # Write merged file
+            merged_file = output_path / "merged_results.md"
+            with open(merged_file, 'w', encoding='utf-8') as f:
+                f.write("".join(all_markdowns))
+
+            logger.info(f"Merged {len(all_markdowns)} files to {merged_file}")
+        else:
+            # Save each PDF to separate markdown file
+            for pdf_path in pdf_paths:
+                try:
+                    pdf_name = Path(pdf_path).stem
+                    output_file = output_path / f"{pdf_name}.md"
+                    self.save_to_markdown(pdf_path, output_file, add_page_markers)
+                except Exception as e:
+                    logger.error(f"Failed to process {pdf_path}: {str(e)}")
+
+    def _export_to_markdown_with_pages(self, doc) -> str:
+        """
+        Export document to Markdown with page number markers.
+
+        This implementation properly handles texts, tables, and pictures by
+        sorting all elements by their page number and position.
+
+        Args:
+            doc: Docling document object
+
+        Returns:
+            Markdown content with page markers
+        """
+        result_parts = []
+        current_page = 0
+
+        # Create a list of all elements with their page info and export function
+        elements = []
+
+        # Add text elements
+        for text_item in doc.document.texts:
+            page_no = 1
+            bbox = None
+
+            if hasattr(text_item, 'prov') and len(text_item.prov) > 0:
+                page_no = text_item.prov[0].page_no + 1
+                if hasattr(text_item.prov[0], 'bbox'):
+                    bbox = text_item.prov[0].bbox
+
+            elements.append({
+                'type': 'text',
+                'page_no': page_no,
+                'bbox': bbox,
+                'content': text_item.text if hasattr(text_item, 'text') else str(text_item)
+            })
+
+        # Add table elements
+        for table_item in doc.document.tables:
+            page_no = 1
+            bbox = None
+            if hasattr(table_item, 'prov') and len(table_item.prov) > 0:
+                page_no = table_item.prov[0].page_no + 1
+                if hasattr(table_item.prov[0], 'bbox'):
+                    bbox = table_item.prov[0].bbox
+
+            # Export table to markdown
+            table_md = table_item.export_to_markdown(doc=doc.document) if hasattr(table_item, 'export_to_markdown') else ''
+
+            elements.append({
+                'type': 'table',
+                'page_no': page_no,
+                'bbox': bbox,
+                'content': table_md
+            })
+
+        # Add picture elements
+        for picture_item in doc.document.pictures:
+            page_no = 1
+            bbox = None
+            if hasattr(picture_item, 'prov') and len(picture_item.prov) > 0:
+                page_no = picture_item.prov[0].page_no + 1
+                if hasattr(picture_item.prov[0], 'bbox'):
+                    bbox = picture_item.prov[0].bbox
+
+            # Export picture to markdown
+            pic_md = picture_item.export_to_markdown(doc=doc.document) if hasattr(picture_item, 'export_to_markdown') else '<!-- image -->'
+
+            elements.append({
+                'type': 'picture',
+                'page_no': page_no,
+                'bbox': bbox,
+                'content': pic_md
+            })
+
+        # Sort elements by page number and then by bbox (top to bottom, left to right)
+        def get_sort_key(element):
+            key = [element['page_no']]
+            if element['bbox'] is not None:
+                # bbox is (left, top, right, bottom) - we want top (y) first, then left (x)
+                key.extend([element['bbox'].t, element['bbox'].l])
+            else:
+                key.extend([0, 0])
+            return tuple(key)
+
+        elements.sort(key=get_sort_key)
+
+        # Build result with page markers
+        for element in elements:
+            page_no = element['page_no']
+            content = element['content']
+
+            # Add page marker if page changed
+            if page_no != current_page:
+                if result_parts:  # Not the first element
+                    result_parts.append("\n\n---\n\n")
+                result_parts.append(f"**第 {page_no} 页**\n\n")
+                current_page = page_no
+
+            # Add content
+            result_parts.append(content)
+
+            # Add newline between elements of the same page
+            if element['type'] != 'picture':
+                result_parts.append('\n')
+            # Extra newline after tables for readability
+            if element['type'] == 'table':
+                result_parts.append('\n')
+
+        return ''.join(result_parts)
