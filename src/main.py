@@ -24,7 +24,7 @@ def parse_single_file(args):
         extract_tables=not args.no_tables,
         extract_images=not args.no_images,
         extract_structure=not args.no_structure,
-        ocr_enabled=args.ocr
+        ocr_enabled=not args.no_ocr
     )
 
     # Parse and save as Markdown
@@ -48,7 +48,7 @@ def parse_directory(args):
         extract_tables=not args.no_tables,
         extract_images=not args.no_images,
         extract_structure=not args.no_structure,
-        ocr_enabled=args.ocr
+        ocr_enabled=not args.no_ocr
     )
 
     # Get all PDF files
@@ -410,9 +410,9 @@ Examples:
     )
 
     parse_parser.add_argument(
-        '--ocr',
+        '--no-ocr',
         action='store_true',
-        help='Enable OCR for scanned PDFs'
+        help='Disable OCR for scanned PDFs'
     )
 
     parse_parser.add_argument(

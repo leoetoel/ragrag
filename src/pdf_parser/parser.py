@@ -3,6 +3,7 @@ Core PDF Parser using Docling
 """
 
 from pathlib import Path
+from collections import defaultdict
 from typing import Union, List, Optional, Dict, Any
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
@@ -41,7 +42,10 @@ class DoclingPDFParser:
         footer_margin_ratio: float = 0.1,  # Bottom 10% of page is footer
         header_footer_patterns: bool = True,  # Use pattern matching to identify headers/footers
         custom_header_patterns: list = None,  # Custom regex patterns for headers
-        custom_footer_patterns: list = None  # Custom regex patterns for footers
+        custom_footer_patterns: list = None,  # Custom regex patterns for footers
+        auto_header_footer: bool = True,  # Detect repeated header/footer text by position
+        min_header_footer_repeat_ratio: float = 0.3,  # Min ratio of pages for repeat detection
+        min_header_footer_repeat_pages: int = 2  # Min pages for repeat detection
     ):
         """
         Initialize the PDF parser.
@@ -57,6 +61,9 @@ class DoclingPDFParser:
             header_footer_patterns: Whether to use pattern matching for better detection (default: True)
             custom_header_patterns: Custom regex patterns to identify header text
             custom_footer_patterns: Custom regex patterns to identify footer text
+            auto_header_footer: Whether to auto-detect repeated header/footer text (default: True)
+            min_header_footer_repeat_ratio: Min ratio of pages to treat as repeated (default: 0.3)
+            min_header_footer_repeat_pages: Min pages to treat as repeated (default: 2)
         """
         self.extract_tables = extract_tables
         self.extract_images = extract_images
@@ -66,6 +73,9 @@ class DoclingPDFParser:
         self.header_margin_ratio = header_margin_ratio
         self.footer_margin_ratio = footer_margin_ratio
         self.header_footer_patterns = header_footer_patterns
+        self.auto_header_footer = auto_header_footer
+        self.min_header_footer_repeat_ratio = min_header_footer_repeat_ratio
+        self.min_header_footer_repeat_pages = min_header_footer_repeat_pages
 
         # Initialize default patterns
         self.header_patterns = self._get_default_header_patterns()
@@ -79,6 +89,7 @@ class DoclingPDFParser:
 
         # Configure pipeline options
         pipeline_options = PdfPipelineOptions()
+        pipeline_options.accelerator_options.device = "cuda"
         pipeline_options.do_ocr = ocr_enabled
         pipeline_options.do_table_structure = extract_tables
 
@@ -98,6 +109,128 @@ class DoclingPDFParser:
 
         logger.info(f"DoclingPDFParser initialized (tables={extract_tables}, "
                    f"images={extract_images}, structure={extract_structure}, ocr={ocr_enabled})")
+
+    def _get_markdown_content(self, doc, add_page_markers: bool) -> str:
+        """Return markdown content from a Docling document."""
+        if add_page_markers:
+            return self._export_to_markdown_with_pages(doc)
+        return doc.document.export_to_markdown()
+
+    def _save_markdown(self, output_path: Union[str, Path], content: str) -> None:
+        """Write markdown content to disk."""
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with open(output, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+    def _get_prov_info(self, item) -> tuple:
+        """
+        Extract provenance info from a Docling item.
+
+        Returns:
+            (page_num, bbox, page_idx)
+        """
+        page_num = 1
+        bbox = None
+        page_idx = 0
+        if hasattr(item, 'prov') and len(item.prov) > 0:
+            prov = item.prov[0]
+            page_idx = prov.page_no
+            page_num = page_idx + 1
+            if hasattr(prov, 'bbox'):
+                bbox = prov.bbox
+        return page_num, bbox, page_idx
+
+    def _get_page_sizes(self, doc_content) -> Dict[int, Any]:
+        """Return mapping of page index to size if available."""
+        page_sizes = {}
+        if hasattr(doc_content, 'pages'):
+            try:
+                for page_idx, page_obj in doc_content.pages.items():
+                    if hasattr(page_obj, 'size'):
+                        page_sizes[page_idx] = page_obj.size
+            except Exception:
+                pass
+        return page_sizes
+
+    def _normalize_hf_text(self, text: str) -> str:
+        """Normalize header/footer text for repeat detection."""
+        import re
+        if not text:
+            return ""
+        text_clean = text.strip().lower()
+        return re.sub(r'\s+', ' ', text_clean)
+
+    def _get_header_footer_area_flags(self, bbox: List[float], page_size) -> tuple:
+        """Return (in_header_area, in_footer_area) based on bbox and page size."""
+        if not bbox or len(bbox) < 4:
+            return False, False
+
+        page_height = getattr(page_size, 'height', None)
+        if page_height is None and isinstance(page_size, (list, tuple)) and len(page_size) >= 2:
+            page_height = page_size[1]
+
+        if page_height is None or page_height <= 0:
+            return False, False
+
+        text_bottom = bbox[1]
+        text_top = bbox[3]
+
+        header_threshold = page_height * (1 - self.header_margin_ratio)
+        footer_threshold = page_height * self.footer_margin_ratio
+
+        in_header_area = text_top > header_threshold
+        in_footer_area = text_bottom < footer_threshold
+        return in_header_area, in_footer_area
+
+    def _build_repeated_header_footer_texts(self, doc_content, page_sizes: Dict[int, Any]) -> Dict[str, set]:
+        """Build repeated header/footer text sets based on position across pages."""
+        if not page_sizes:
+            return {"header": set(), "footer": set()}
+
+        header_hits = defaultdict(set)
+        footer_hits = defaultdict(set)
+        max_page_idx = -1
+
+        for item in doc_content.texts:
+            _, bbox_obj, page_idx = self._get_prov_info(item)
+            if page_idx > max_page_idx:
+                max_page_idx = page_idx
+            if page_idx not in page_sizes:
+                continue
+            if bbox_obj is None:
+                continue
+
+            text_raw = item.text if hasattr(item, 'text') else str(item)
+            text_norm = self._normalize_hf_text(text_raw)
+            if len(text_norm) <= 2:
+                continue
+
+            bbox_list = list(bbox_obj.as_tuple()) if hasattr(bbox_obj, 'as_tuple') else list(bbox_obj)
+            in_header_area, in_footer_area = self._get_header_footer_area_flags(
+                bbox_list,
+                page_sizes[page_idx]
+            )
+
+            if in_header_area:
+                header_hits[text_norm].add(page_idx)
+            if in_footer_area:
+                footer_hits[text_norm].add(page_idx)
+
+        page_count = len(page_sizes) if page_sizes else max_page_idx + 1
+        if page_count <= 0:
+            return {"header": set(), "footer": set()}
+
+        min_pages = max(
+            self.min_header_footer_repeat_pages,
+            int(page_count * self.min_header_footer_repeat_ratio)
+        )
+        if min_pages <= 1:
+            min_pages = 2
+
+        header_texts = {text for text, pages in header_hits.items() if len(pages) >= min_pages}
+        footer_texts = {text for text, pages in footer_hits.items() if len(pages) >= min_pages}
+        return {"header": header_texts, "footer": footer_texts}
 
     def _get_default_header_patterns(self) -> list:
         """
@@ -276,19 +409,9 @@ class DoclingPDFParser:
             # Convert document
             doc = self.converter.convert(str(path))
 
-            if add_page_markers:
-                # Export with page markers
-                markdown_content = self._export_to_markdown_with_pages(doc)
-            else:
-                # Standard export
-                markdown_content = doc.document.export_to_markdown()
-
-            # Save to file
+            markdown_content = self._get_markdown_content(doc, add_page_markers)
             output = Path(output_path)
-            output.parent.mkdir(parents=True, exist_ok=True)
-
-            with open(output, 'w', encoding='utf-8') as f:
-                f.write(markdown_content)
+            self._save_markdown(output, markdown_content)
 
             logger.info(f"Saved Markdown to {output} ({len(markdown_content)} chars)")
 
@@ -323,27 +446,22 @@ class DoclingPDFParser:
                 for page_no, page_obj in doc_pages.items():
                     if hasattr(page_obj, 'size'):
                         page_sizes_seen[page_no] = page_obj.size
+        repeat_texts = None
+        if self.exclude_headers_footers and self.auto_header_footer and page_sizes_seen:
+            repeat_texts = self._build_repeated_header_footer_texts(doc.document, page_sizes_seen)
 
         # Create a list of all elements with their page info and export function
         elements = []
 
         # Add text elements
         for text_item in doc.document.texts:
-            page_no = 1
-            bbox = None
-            page_idx = 0
-
-            if hasattr(text_item, 'prov') and len(text_item.prov) > 0:
-                page_idx = text_item.prov[0].page_no
-                page_no = page_idx + 1
-                if hasattr(text_item.prov[0], 'bbox'):
-                    bbox = text_item.prov[0].bbox
+            page_no, bbox, page_idx = self._get_prov_info(text_item)
 
             # Skip headers and footers if enabled
             if self.exclude_headers_footers and bbox and page_idx in page_sizes_seen:
                 bbox_list = list(bbox.as_tuple()) if hasattr(bbox, 'as_tuple') else list(bbox)
                 text_content = text_item.text if hasattr(text_item, 'text') else str(text_item)
-                if self._is_header_or_footer(bbox_list, page_sizes_seen[page_idx], text_content):
+                if self._is_header_or_footer(bbox_list, page_sizes_seen[page_idx], text_content, repeat_texts):
                     continue
 
             elements.append({
@@ -355,12 +473,7 @@ class DoclingPDFParser:
 
         # Add table elements
         for table_item in doc.document.tables:
-            page_no = 1
-            bbox = None
-            if hasattr(table_item, 'prov') and len(table_item.prov) > 0:
-                page_no = table_item.prov[0].page_no + 1
-                if hasattr(table_item.prov[0], 'bbox'):
-                    bbox = table_item.prov[0].bbox
+            page_no, bbox, _ = self._get_prov_info(table_item)
 
             # Export table to markdown
             table_md = table_item.export_to_markdown(doc=doc.document) if hasattr(table_item, 'export_to_markdown') else ''
@@ -374,12 +487,7 @@ class DoclingPDFParser:
 
         # Add picture elements
         for picture_item in doc.document.pictures:
-            page_no = 1
-            bbox = None
-            if hasattr(picture_item, 'prov') and len(picture_item.prov) > 0:
-                page_no = picture_item.prov[0].page_no + 1
-                if hasattr(picture_item.prov[0], 'bbox'):
-                    bbox = picture_item.prov[0].bbox
+            page_no, bbox, _ = self._get_prov_info(picture_item)
 
             # Export picture to markdown
             pic_md = picture_item.export_to_markdown(doc=doc.document) if hasattr(picture_item, 'export_to_markdown') else '<!-- image -->'
@@ -458,11 +566,7 @@ class DoclingPDFParser:
                     logger.info(f"Processing {idx}/{len(pdf_paths)}: {pdf_path}")
                     doc = self.converter.convert(str(pdf_path))
 
-                    # Export with or without page markers
-                    if add_page_markers:
-                        markdown_content = self._export_to_markdown_with_pages(doc)
-                    else:
-                        markdown_content = doc.document.export_to_markdown()
+                    markdown_content = self._get_markdown_content(doc, add_page_markers)
 
                     # Add file name as header
                     pdf_name = Path(pdf_path).stem
@@ -474,8 +578,7 @@ class DoclingPDFParser:
 
             # Write merged file
             merged_file = output_path / merged_filename
-            with open(merged_file, 'w', encoding='utf-8') as f:
-                f.write("".join(all_markdowns))
+            self._save_markdown(merged_file, "".join(all_markdowns))
 
             logger.info(f"Saved merged Markdown to {merged_file}")
 
@@ -485,18 +588,13 @@ class DoclingPDFParser:
                 try:
                     doc = self.converter.convert(str(pdf_path))
 
-                    # Export with or without page markers
-                    if add_page_markers:
-                        markdown_content = self._export_to_markdown_with_pages(doc)
-                    else:
-                        markdown_content = doc.document.export_to_markdown()
+                    markdown_content = self._get_markdown_content(doc, add_page_markers)
 
                     # Use filename without .pdf as markdown filename
                     md_name = Path(pdf_path).stem + ".md"
                     md_path = output_path / md_name
 
-                    with open(md_path, 'w', encoding='utf-8') as f:
-                        f.write(markdown_content)
+                    self._save_markdown(md_path, markdown_content)
 
                     logger.info(f"Saved {md_path}")
 
@@ -543,36 +641,26 @@ class DoclingPDFParser:
     def _extract_all_text(self, doc_content, result: ParseResult) -> None:
         """Extract all text content with page information."""
         try:
-            # Build a mapping of page numbers to page dimensions
-            page_dimensions = {}
-            # doc_content.pages is a dict, we need to get the actual doc object to access pages as list
-            # For now, we'll collect page info from provenance in text items
-            page_sizes_seen = {}
+            page_sizes_seen = self._get_page_sizes(doc_content) if self.exclude_headers_footers else {}
+            repeat_texts = None
+            if self.exclude_headers_footers and self.auto_header_footer and page_sizes_seen:
+                repeat_texts = self._build_repeated_header_footer_texts(doc_content, page_sizes_seen)
 
             # Iterate through text elements
             for item in doc_content.texts:
-                page_num = 1
-                bbox = None
-                page_idx = 0
+                page_num, bbox_obj, page_idx = self._get_prov_info(item)
+                bbox = list(bbox_obj.as_tuple()) if bbox_obj is not None else None
 
-                # Get page number and bbox from provenance
-                if hasattr(item, 'prov') and len(item.prov) > 0:
-                    prov = item.prov[0]
-                    page_idx = prov.page_no
-                    page_num = page_idx + 1
-                    if hasattr(prov, 'bbox'):
-                        bbox = list(prov.bbox.as_tuple())
-
-                    # Try to get page size from doc_content.pages (which is a dict)
-                    if self.exclude_headers_footers and page_idx not in page_sizes_seen:
-                        if hasattr(doc_content, 'pages') and page_idx in doc_content.pages:
-                            page_obj = doc_content.pages[page_idx]
-                            if hasattr(page_obj, 'size'):
-                                page_sizes_seen[page_idx] = page_obj.size
+                # Try to get page size from doc_content.pages (which is a dict)
+                if self.exclude_headers_footers and page_idx not in page_sizes_seen:
+                    if hasattr(doc_content, 'pages') and page_idx in doc_content.pages:
+                        page_obj = doc_content.pages[page_idx]
+                        if hasattr(page_obj, 'size'):
+                            page_sizes_seen[page_idx] = page_obj.size
 
                 # Skip headers and footers if enabled
                 if self.exclude_headers_footers and bbox and page_idx in page_sizes_seen:
-                    if self._is_header_or_footer(bbox, page_sizes_seen[page_idx], item.text):
+                    if self._is_header_or_footer(bbox, page_sizes_seen[page_idx], item.text, repeat_texts):
                         continue
 
                 text_content = TextContent(
@@ -585,7 +673,13 @@ class DoclingPDFParser:
         except Exception as e:
             logger.warning(f"Error extracting text: {e}")
 
-    def _is_header_or_footer(self, bbox: List[float], page_size, text: str) -> bool:
+    def _is_header_or_footer(
+        self,
+        bbox: List[float],
+        page_size,
+        text: str,
+        repeat_texts: Optional[Dict[str, set]] = None
+    ) -> bool:
         """
         Check if text element is in header or footer area using position and pattern matching.
 
@@ -593,36 +687,12 @@ class DoclingPDFParser:
             bbox: Bounding box as [left, bottom, right, top] (from bbox.as_tuple())
             page_size: Page size object with width and height attributes
             text: The text content to check for header/footer patterns
+            repeat_texts: Optional repeated header/footer text sets
 
         Returns:
             True if the element should be excluded (is in header or footer)
         """
-        if not bbox or len(bbox) < 4:
-            return False
-
-        # page_size is an object with width and height attributes
-        page_width = getattr(page_size, 'width', None)
-        page_height = getattr(page_size, 'height', None)
-
-        if page_height is None or page_height <= 0:
-            return False
-
-        # bbox.as_tuple() returns: [left, bottom, right, top]
-        # In BOTTOMLEFT coordinate system (y=0 at bottom, y increases upward):
-        text_bottom = bbox[1]  # Lower y-coordinate
-        text_top = bbox[3]     # Higher y-coordinate
-
-        # Calculate thresholds
-        # Header area: top margin (y values near page_height)
-        header_threshold = page_height * (1 - self.header_margin_ratio)
-        # Footer area: bottom margin (y values near 0)
-        footer_threshold = page_height * self.footer_margin_ratio
-
-        # Check if in header area (top margin - high y values)
-        in_header_area = text_top > header_threshold
-
-        # Check if in footer area (bottom margin - low y values)
-        in_footer_area = text_bottom < footer_threshold
+        in_header_area, in_footer_area = self._get_header_footer_area_flags(bbox, page_size)
 
         # If not in header or footer area, don't exclude
         if not (in_header_area or in_footer_area):
@@ -634,12 +704,19 @@ class DoclingPDFParser:
 
         # If in header area, check if text matches header patterns
         if in_header_area:
+            if repeat_texts:
+                text_norm = self._normalize_hf_text(text)
+                if text_norm and text_norm in repeat_texts.get("header", set()):
+                    return True
             return self._matches_header_pattern(text)
 
         # If in footer area, check if text matches footer patterns
         if in_footer_area:
-            match_result = self._matches_footer_pattern(text)
-            return match_result
+            if repeat_texts:
+                text_norm = self._normalize_hf_text(text)
+                if text_norm and text_norm in repeat_texts.get("footer", set()):
+                    return True
+            return self._matches_footer_pattern(text)
 
         return False
 
@@ -710,9 +787,7 @@ class DoclingPDFParser:
         """Extract detailed information from a table."""
         try:
             # Get page number
-            page_num = 1
-            if hasattr(table, 'prov') and len(table.prov) > 0:
-                page_num = table.prov[0].page_no + 1
+            page_num, _, _ = self._get_prov_info(table)
 
             # Extract table data
             cells = []
@@ -784,16 +859,13 @@ class DoclingPDFParser:
         """Extract detailed information from an image."""
         try:
             # Get page number
-            page_num = 1
-            if hasattr(picture, 'prov') and len(picture.prov) > 0:
-                page_num = picture.prov[0].page_no + 1
+            page_num, _, _ = self._get_prov_info(picture)
 
             # Get bounding box
             bbox = [0.0, 0.0, 0.0, 0.0]
-            if hasattr(picture, 'prov') and len(picture.prov) > 0:
-                prov = picture.prov[0]
-                if hasattr(prov, 'bbox'):
-                    bbox = list(prov.bbox.as_tuple())
+            _, bbox_obj, _ = self._get_prov_info(picture)
+            if bbox_obj is not None and hasattr(bbox_obj, 'as_tuple'):
+                bbox = list(bbox_obj.as_tuple())
 
             return ImageInfo(
                 page_num=page_num,
@@ -845,9 +917,7 @@ class DoclingPDFParser:
 
             # Only add if it's a structural element
             if structure_type:
-                page_num = 1
-                if hasattr(item, 'prov') and len(item.prov) > 0:
-                    page_num = item.prov[0].page_no + 1
+                page_num, _, _ = self._get_prov_info(item)
 
                 return DocumentStructure(
                     type=structure_type,
