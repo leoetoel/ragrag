@@ -21,11 +21,17 @@ from .embedder import BGEEmbedder
 from .models import VectorSearchResult
 from .utils import logger
 
+try:
+    from sentence_transformers import CrossEncoder
+except ImportError:
+    CrossEncoder = None
+
 
 def rrf_fusion(
     results_list1: List[VectorSearchResult],
     results_list2: List[VectorSearchResult],
-    k: int = 60
+    k: int = 60,
+    alpha: float = 0.2
 ) -> List[Tuple[VectorSearchResult, float]]:
     """
     Reciprocal Rank Fusion (RRF) algorithm.
@@ -37,25 +43,28 @@ def rrf_fusion(
         results_list1: First ranked list (e.g., BM25 results)
         results_list2: Second ranked list (e.g., Vector results)
         k: Constant to prevent rank differences from being too large (default: 60)
+        alpha: Weight for results_list1; results_list2 uses (1 - alpha)
 
     Returns:
         List of (result, fusion_score) tuples, sorted by fusion_score
     """
     fusion_scores = {}
 
+    alpha = max(0.0, min(1.0, alpha))
+
     # Process first list (e.g., BM25)
     for rank, result in enumerate(results_list1):
         chunk_id = result.chunk_id
         if chunk_id not in fusion_scores:
             fusion_scores[chunk_id] = {"result": result, "score": 0.0}
-        fusion_scores[chunk_id]["score"] += 1 / (k + rank)
+        fusion_scores[chunk_id]["score"] += alpha / (k + rank)
 
     # Process second list (e.g., Vector)
     for rank, result in enumerate(results_list2):
         chunk_id = result.chunk_id
         if chunk_id not in fusion_scores:
             fusion_scores[chunk_id] = {"result": result, "score": 0.0}
-        fusion_scores[chunk_id]["score"] += 1 / (k + rank)
+        fusion_scores[chunk_id]["score"] += (1 - alpha) / (k + rank)
 
     # Sort by fusion score (descending)
     sorted_items = sorted(
@@ -81,7 +90,8 @@ class HybridSearcher:
         self,
         vector_store: MilvusVectorStore,
         embedder: BGEEmbedder,
-        bm25_corpus: Optional[List[str]] = None
+        bm25_corpus: Optional[List[str]] = None,
+        reranker: Optional[object] = None
     ):
         """
         Initialize hybrid searcher.
@@ -95,6 +105,7 @@ class HybridSearcher:
         self.embedder = embedder
         self.bm25_model = None
         self.bm25_corpus = bm25_corpus
+        self.reranker = reranker
 
         # Initialize BM25 if corpus is provided
         if bm25_corpus:
@@ -203,11 +214,12 @@ class HybridSearcher:
     def search_hybrid(
         self,
         query: str,
-        top_k: int = 10,
+        top_k: int = 50,
         bm25_k: int = 50,
         vector_k: int = 50,
         rrf_k: int = 60,
-        alpha: float = 0.5
+        alpha: float = 0.2,
+        rerank_top_k: Optional[int] = None
     ) -> List[Dict]:
         """
         Hybrid search combining BM25 and Vector with RRF fusion.
@@ -235,10 +247,26 @@ class HybridSearcher:
 
         # Step 3: RRF fusion
         logger.info(f"[3/3] RRF fusion...")
-        fusion_results = rrf_fusion(bm25_results, vector_results, k=rrf_k)
+        fusion_results = rrf_fusion(bm25_results, vector_results, k=rrf_k, alpha=alpha)
 
         # Take top-k results
         final_results = fusion_results[:top_k]
+
+        # Optional rerank with CrossEncoder
+        if self.reranker is not None:
+            rerank_k = rerank_top_k or len(final_results)
+            rerank_k = min(rerank_k, len(final_results))
+            rerank_pairs = [[query, result.content] for result, _ in final_results[:rerank_k]]
+            try:
+                rerank_scores = self.reranker.predict(rerank_pairs, show_progress_bar=False)
+            except Exception as e:
+                logger.warning(f"Rerank failed: {e}")
+                rerank_scores = None
+
+            if rerank_scores is not None:
+                reranked = list(zip(final_results[:rerank_k], rerank_scores))
+                reranked.sort(key=lambda x: x[1], reverse=True)
+                final_results = [item[0] for item in reranked] + final_results[rerank_k:]
 
         # Format output
         formatted_results = []

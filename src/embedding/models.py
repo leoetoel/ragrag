@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 class EmbeddingConfig(BaseModel):
     """Configuration for embedding model"""
-    model_name: str = Field(default="BAAI/bge-large-zh-v1.5", description="Model name or path")
+    model_name: str = Field(default="BAAI/bge-m3", description="Model name or path")
     device: str = Field(default="cuda", description="Device: cuda, cpu, or mps")
     batch_size: int = Field(default=32, description="Batch size for encoding")
     max_length: int = Field(default=512, description="Maximum sequence length")

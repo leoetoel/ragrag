@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from pdf_parser import DoclingPDFParser
 from pdf_parser.utils import get_pdf_files, logger
-from chunker import MarkdownChunker
+from chunker import AnnualReportChunker
 from embedding import (
     BGEEmbedder, MilvusVectorStore, HybridSearcher,
     EmbeddingConfig, MilvusConfig
@@ -81,15 +81,16 @@ def chunk_file(args):
     """Chunk a single Markdown file."""
     import json
 
-    chunker = MarkdownChunker(
-        chunk_size=args.chunk_size,
-        chunk_overlap=args.overlap,
-        hard_limit=args.hard_limit,
-        preserve_tables=not args.no_table_protection
-    )
+    chunker = AnnualReportChunker()
 
     # Chunk the file
-    result = chunker.chunk_file(args.input)
+    content = Path(args.input).read_text(encoding='utf-8')
+    sections = chunker.chunk_by_sections(
+        content,
+        min_chars=100,
+        max_chars=args.chunk_size,
+        merge_small=True
+    )
 
     # Save chunks as JSON array
     output_path = Path(args.output)
@@ -99,11 +100,15 @@ def chunk_file(args):
 
     # Convert chunks to the required format
     chunks_output = []
-    for chunk in result.chunks:
+    for idx, section in enumerate(sections):
         chunk_data = {
-            "chunk_id": chunk.chunk_id,
-            "content": chunk.content,
-            "metadata": chunk.metadata
+            "chunk_id": f"chunk_{idx}",
+            "content": section.get("content", ""),
+            "metadata": {
+                "source": str(args.input),
+                "page": None,
+                "section": section.get("title")
+            }
         }
         chunks_output.append(chunk_data)
 
@@ -117,12 +122,12 @@ def chunk_file(args):
     print(f"\n=== Chunking Summary ===")
     print(f"Source: {args.input}")
     print(f"Output: {output_file}")
-    print(f"Total Chunks: {result.total_chunks}")
+    print(f"Total Chunks: {len(sections)}")
     print(f"Chunk Size: {args.chunk_size} chars")
     print(f"Overlap: {args.overlap} chars")
 
     # Show chunk statistics
-    sizes = [c.char_count for c in result.chunks]
+    sizes = [len(section.get("content", "")) for section in sections if section.get("content")]
     print(f"Size Statistics:")
     print(f"  Min: {min(sizes)} chars")
     print(f"  Max: {max(sizes)} chars")
@@ -130,25 +135,20 @@ def chunk_file(args):
 
     if args.show_chunks:
         print(f"\n=== First 3 Chunks Preview ===")
-        for i, chunk in enumerate(result.chunks[:3], 1):
+        for i, section in enumerate(sections[:3], 1):
             print(f"\n--- Chunk {i} ---")
-            print(f"ID: {chunk.chunk_id}")
-            print(f"Section: {chunk.metadata.get('section', 'N/A')}")
-            print(f"Page: {chunk.metadata.get('page', 'N/A')}")
-            print(f"Characters: {chunk.char_count}")
-            print(f"Content Preview:\n{chunk.content[:300]}...")
+            print(f"ID: chunk_{i - 1}")
+            print(f"Section: {section.get('title', 'N/A')}")
+            print(f"Page: N/A")
+            print(f"Characters: {len(section.get('content', '').strip())}")
+            print(f"Content Preview:\n{section.get('content', '')[:300]}...")
 
 
 def chunk_directory(args):
     """Chunk all Markdown files in a directory."""
     import json
 
-    chunker = MarkdownChunker(
-        chunk_size=args.chunk_size,
-        chunk_overlap=args.overlap,
-        hard_limit=args.hard_limit,
-        preserve_tables=not args.no_table_protection
-    )
+    chunker = AnnualReportChunker()
 
     # Find all Markdown files
     input_path = Path(args.input)
@@ -168,20 +168,29 @@ def chunk_directory(args):
     # Process each file
     for md_file in md_files:
         print(f"\nProcessing: {md_file.name}")
-        result = chunker.chunk_file(str(md_file))
-        all_results.append(result)
-        total_chunks += result.total_chunks
+        content = md_file.read_text(encoding='utf-8')
+        sections = chunker.chunk_by_sections(
+            content,
+            min_chars=100,
+            max_chars=args.chunk_size,
+            merge_small=True
+        )
+        total_chunks += len(sections)
 
         # Save chunks for this file as JSON
         output_file = output_path / f"{md_file.stem}_chunks.json"
 
         # Convert chunks to the required format
         chunks_output = []
-        for chunk in result.chunks:
+        for idx, section in enumerate(sections):
             chunk_data = {
-                "chunk_id": chunk.chunk_id,
-                "content": chunk.content,
-                "metadata": chunk.metadata
+                "chunk_id": f"chunk_{idx}",
+                "content": section.get("content", ""),
+                "metadata": {
+                    "source": str(md_file),
+                    "page": None,
+                    "section": section.get("title")
+                }
             }
             chunks_output.append(chunk_data)
 
@@ -189,7 +198,7 @@ def chunk_directory(args):
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(chunks_output, f, ensure_ascii=False, indent=2)
 
-        print(f"  -> {output_file.name} ({result.total_chunks} chunks)")
+        print(f"  -> {output_file.name} ({len(sections)} chunks)")
 
     # Print overall summary
     print(f"\n=== Batch Chunking Summary ===")
@@ -300,10 +309,20 @@ def hybrid_search_vectors(args):
     store = MilvusVectorStore(store_config)
     store.load_collection()
 
+    # Initialize optional reranker
+    reranker = None
+    if args.rerank:
+        try:
+            from sentence_transformers import CrossEncoder
+            reranker = CrossEncoder(args.rerank_model, device=args.device)
+        except Exception as e:
+            print(f"Warning: Failed to load reranker: {e}")
+
     # Initialize hybrid searcher
     hybrid_searcher = HybridSearcher(
         vector_store=store,
-        embedder=embedder
+        embedder=embedder,
+        reranker=reranker
     )
 
     # Load chunks for BM25
@@ -323,6 +342,7 @@ def hybrid_search_vectors(args):
     print(f"BM25 top-k: {args.bm25_k}")
     print(f"Vector top-k: {args.vector_k}")
     print(f"RRF k: {args.rrf_k}")
+    print(f"RRF alpha (BM25 weight): {args.alpha}")
     print()
 
     results = hybrid_searcher.search_hybrid(
@@ -330,7 +350,9 @@ def hybrid_search_vectors(args):
         top_k=args.top_k,
         bm25_k=args.bm25_k,
         vector_k=args.vector_k,
-        rrf_k=args.rrf_k
+        rrf_k=args.rrf_k,
+        alpha=args.alpha,
+        rerank_top_k=args.rerank_top_k if args.rerank else None
     )
 
     print(f"\n=== Results (RRF Fusion) ===")
@@ -488,8 +510,8 @@ Examples:
     embed_parser.add_argument(
         '--model',
         type=str,
-        default='BAAI/bge-large-zh-v1.5',
-        help='Embedding model name (default: BAAI/bge-large-zh-v1.5)'
+        default='BAAI/bge-m3',
+        help='Embedding model name (default: BAAI/bge-m3)'
     )
 
     embed_parser.add_argument(
@@ -561,8 +583,8 @@ Examples:
     search_parser.add_argument(
         '--model',
         type=str,
-        default='BAAI/bge-large-zh-v1.5',
-        help='Embedding model name (default: BAAI/bge-large-zh-v1.5)'
+        default='BAAI/bge-m3',
+        help='Embedding model name (default: BAAI/bge-m3)'
     )
 
     search_parser.add_argument(
@@ -627,8 +649,8 @@ Examples:
     hybrid_parser.add_argument(
         '--model',
         type=str,
-        default='BAAI/bge-large-zh-v1.5',
-        help='Embedding model name (default: BAAI/bge-large-zh-v1.5)'
+        default='BAAI/bge-m3',
+        help='Embedding model name (default: BAAI/bge-m3)'
     )
 
     hybrid_parser.add_argument(
@@ -693,6 +715,29 @@ Examples:
         type=int,
         default=60,
         help='RRF constant k (default: 60)'
+    )
+    hybrid_parser.add_argument(
+        '--rerank',
+        action='store_true',
+        help='Enable CrossEncoder rerank (default: False)'
+    )
+    hybrid_parser.add_argument(
+        '--rerank-model',
+        type=str,
+        default='BAAI/bge-reranker-large',
+        help='CrossEncoder model name (default: BAAI/bge-reranker-large)'
+    )
+    hybrid_parser.add_argument(
+        '--rerank-top-k',
+        type=int,
+        default=10,
+        help='Rerank top-k candidates (default: 10)'
+    )
+    hybrid_parser.add_argument(
+        '--alpha',
+        type=float,
+        default=0.5,
+        help='Weight for BM25 in RRF fusion (default: 0.5)'
     )
 
     args = parser.parse_args()

@@ -156,14 +156,24 @@ class MilvusVectorStore:
         if len(chunks) != len(embeddings):
             raise ValueError("Chunks and embeddings must have same length")
 
+        # Ensure chunk_id exists for every chunk (Milvus primary key)
+        for idx, chunk in enumerate(chunks):
+            if not chunk.get('chunk_id'):
+                chunk['chunk_id'] = f"chunk_{idx}"
+            if 'metadata' not in chunk or chunk['metadata'] is None:
+                chunk['metadata'] = {}
+
         # Prepare data - convert None values to empty strings
+        def _truncate(text: str, max_len: int) -> str:
+            return text if len(text) <= max_len else text[:max_len]
+
         data = [
             [chunk['chunk_id'] for chunk in chunks],
             embeddings,
             [chunk['content'] for chunk in chunks],
             [chunk['metadata'].get('source', '') or '' for chunk in chunks],
             [int(chunk['metadata'].get('page', 0)) if chunk['metadata'].get('page') else 0 for chunk in chunks],
-            [chunk['metadata'].get('section', '') or '' for chunk in chunks],
+            [_truncate(chunk['metadata'].get('section', '') or '', 512) for chunk in chunks],
         ]
 
         # Insert
